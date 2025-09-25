@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
 """
-XML_to_Daybook_voucherid_inventoryallocs_fixed.py
+XML_to_Daybook_voucherid_inventoryallocs_fixed_plusfields_ref.py
 
-Fixed version of the original script. Root cause of the missing "Local Purchases 12 % -22800" line:
-
-* The script previously removed *identical rows* at the end (deduped tuples), which collapsed
-  distinct item-level accounting allocations that legitimately had the same ledger name and amount
-  (e.g. two separate inventory items each allocating -22800 to the same ledger).
-
-Fix applied:
-* Removed the final tuple-based dedupe so that separate accounting allocations are preserved.
-* Kept the existing de-duplication of XML elements (by element identity) inside
-  `collect_ledger_entries_from_voucher` to avoid accidentally adding the *same* element twice.
-
-If you prefer to still collapse truly duplicate lines while preserving separate allocations,
-we can add a unique sequence/line index column (or a unique allocation id) instead. For now
-this change preserves each allocation as a separate CSV row.
-
-Outputs: voucher_id, vch_type, vch_key, date, gl_account, amount, narration
+Adds voucher-level and item-level fields to CSV rows, including REFERENCE.
+Outputs columns:
+voucher_id, vch_type, vch_key, date, vouchernumber, reference, partyname,
+gl_account, stockitemname, rate, actualqty, billedqty, amount, narration
 """
 
 from pathlib import Path
@@ -132,38 +120,50 @@ def reformat_date(s):
         return f"{y}-{mo}-{da}"
     return s
 
-# --------- ledger collection (unchanged) ----------
+# --------- ledger collection (enhanced: attach inventory context) ----------
 def collect_ledger_entries_from_voucher(v):
+    """
+    Returns a list of dicts: {'elem': element_containing_LEDGERNAME/AMOUNT, 'inv': inventory_entry_or_None}
+    inv is the ALLINVENTORYENTRIES.LIST element that this accounting allocation belongs to (if any).
+    """
     entries = []
 
+    # voucher-level ledger containers (direct children only)
     for child in v:
         t = strip_tag(child.tag)
         if 'LEDGERENTRIES' in t or 'ALLLEDGERENTRIES' in t:
+            # If child itself contains LEDGERNAME/AMOUNT, treat as one entry (inv=None)
             if any(strip_tag(c.tag) in ('LEDGERNAME','PARTYLEDGERNAME','NAME','AMOUNT') for c in child):
-                entries.append(child)
+                entries.append({'elem': child, 'inv': None})
             else:
+                # else its direct LIST children may be individual entries
                 for sub in child:
                     if any(strip_tag(c.tag) in ('LEDGERNAME','PARTYLEDGERNAME','NAME','AMOUNT') for c in sub):
-                        entries.append(sub)
+                        entries.append({'elem': sub, 'inv': None})
 
+    # inventory-level accounting allocations: attach inv context
     for child in v:
         t = strip_tag(child.tag)
-        if 'ALLINVENTORYENTRIES' in t or 'ALLINVENTORYENTRIES.LIST' in t or t.endswith('ALLINVENTORYENTRIES.LIST'.upper()):
+        if 'ALLINVENTORYENTRIES' in t:
+            # child is an inventory entry (inv_entry)
             for inv_sub in child:
                 st = strip_tag(inv_sub.tag)
-                if 'ACCOUNTINGALLOCATIONS' in st or 'ACCOUNTINGALLOCATIONS.LIST' in st:
+                if 'ACCOUNTINGALLOCATIONS' in st:
+                    # inv_sub might itself contain ledger info
                     if any(strip_tag(c.tag) in ('LEDGERNAME','PARTYLEDGERNAME','NAME','AMOUNT') for c in inv_sub):
-                        entries.append(inv_sub)
+                        entries.append({'elem': inv_sub, 'inv': child})
                     else:
+                        # check direct children under ACCOUNTINGALLOCATIONS for ledger allocations
                         for acct in inv_sub:
                             if any(strip_tag(c.tag) in ('LEDGERNAME','PARTYLEDGERNAME','NAME','AMOUNT') for c in acct):
-                                entries.append(acct)
+                                entries.append({'elem': acct, 'inv': child})
 
-    # dedupe by element identity (prevents the *same* Element object being added twice)
+    # dedupe by element identity (prevents same Element object being added twice)
     seen = set(); unique=[]
     for e in entries:
-        if id(e) not in seen:
-            unique.append(e); seen.add(id(e))
+        objid = id(e['elem'])
+        if objid not in seen:
+            unique.append(e); seen.add(objid)
     return unique
 
 
@@ -180,12 +180,7 @@ def extract_voucher_id(v):
             return str(val)
     return ''
 
-# --- new helper: extract voucher type and vchkey ---
 def extract_voucher_type_and_key(v):
-    """
-    Returns (vch_type, vch_key) trying attributes first, then child elements.
-    """
-    # try attributes first (most Tally exports place these as attributes on <VOUCHER>)
     vch_type = ''
     vch_key = ''
     for k, val in (v.attrib.items() if hasattr(v, 'attrib') else []):
@@ -194,23 +189,29 @@ def extract_voucher_type_and_key(v):
             vch_type = str(val)
         elif kname == 'VCHKEY' and not vch_key:
             vch_key = str(val)
-        elif kname == 'VCHKEY'.upper() and not vch_key:
-            vch_key = str(val)
-
-    # fallback: check for child elements containing these values
     if not vch_type:
         vch_type = text_of_child(v, ('VCHTYPE','VOUCHERTYPE','TYPE')) or ''
     if not vch_key:
         vch_key = text_of_child(v, ('VCHKEY','VOUCHERKEY','KEY')) or ''
-
-    # final fallback: search anywhere under the voucher
     if not vch_type:
         vch_type = find_text_anywhere(v, ('VCHTYPE','VOUCHERTYPE','TYPE')) or ''
     if not vch_key:
         vch_key = find_text_anywhere(v, ('VCHKEY','VOUCHERKEY','KEY')) or ''
-
     return vch_type, vch_key
 
+def extract_inventory_fields(inv_elem):
+    """
+    Given ALLINVENTORYENTRIES.LIST element, return tuple:
+    (stockitemname, rate, actualqty, billedqty)
+    If any field missing -> empty string
+    """
+    if inv_elem is None:
+        return ('', '', '', '')
+    stockitem = text_of_child(inv_elem, ('STOCKITEMNAME','STOCKITEM','STOCKITEMNAME')) or ''
+    rate = text_of_child(inv_elem, ('RATE',)) or ''
+    actualqty = text_of_child(inv_elem, ('ACTUALQTY','ACTUALQTY')) or ''
+    billedqty = text_of_child(inv_elem, ('BILLEDQTY','BILLEDQTY')) or ''
+    return (stockitem, rate, actualqty, billedqty)
 
 def parse_tally_daybook_from_string(xml_text: str, csv_path: Path):
     print("Parsing XML data...")
@@ -228,36 +229,47 @@ def parse_tally_daybook_from_string(xml_text: str, csv_path: Path):
             print(f"Processed {i + 1}/{total_vouchers} vouchers...")
         
         voucher_id = extract_voucher_id(v)
-        vch_type, vch_key = extract_voucher_type_and_key(v)  # <-- new extraction
+        vch_type, vch_key = extract_voucher_type_and_key(v)
         date_raw = text_of_child(v, ['DATE','VOUCHERDATE']) or ''
         narration = (text_of_child(v, ['NARRATION']) or '').replace('\n',' ').strip()
         date = reformat_date(date_raw)
+
+        # voucher-level additional fields
+        partyname = text_of_child(v, ('PARTYNAME','PARTYLEDGERNAME','PARTYMAILINGNAME')) or ''
+        vouchernumber = text_of_child(v, ('VOUCHERNUMBER','VCHNUM','VOUCHERNO')) or ''
+        reference = text_of_child(v, ('REFERENCE','REF')) or ''
+
         ledger_entries = collect_ledger_entries_from_voucher(v)
 
         if not ledger_entries:
             ledgername = text_of_child(v, ['LEDGERNAME','PARTYLEDGERNAME','NAME']) or ''
             amount = normalize_amount(text_of_child(v, ['AMOUNT']) or '')
-            rows.append((voucher_id, vch_type, vch_key, date, ledgername, amount, narration))
+            stockitem, rate, actualqty, billedqty = ('', '', '', '')
+            rows.append((voucher_id, vch_type, vch_key, date, vouchernumber, reference, partyname,
+                         ledgername, stockitem, rate, actualqty, billedqty, amount, narration))
         else:
-            for le in ledger_entries:
+            for item in ledger_entries:
+                le = item['elem']
+                inv = item['inv']  # inventory context element or None
                 ledgername = text_of_child(le, ['LEDGERNAME','PARTYLEDGERNAME','NAME']) or ''
                 amount = normalize_amount(text_of_child(le, ['AMOUNT']) or '')
-                if ledgername or amount:
-                    rows.append((voucher_id, vch_type, vch_key, date, ledgername, amount, narration))
-
-    # NOTE: previously the script removed exact duplicate rows by tuple equality here which
-    # caused multiple separate item-level allocations with identical ledger+amount to be
-    # collapsed to a single row. We now preserve all rows as collected above so that each
-    # inventory accounting allocation remains a separate CSV line.
+                stockitem, rate, actualqty, billedqty = extract_inventory_fields(inv)
+                # If le's amount empty, try inventory amount.
+                if not amount and inv is not None:
+                    amount = normalize_amount(text_of_child(inv, ['AMOUNT']) or '')
+                rows.append((voucher_id, vch_type, vch_key, date, vouchernumber, reference, partyname,
+                             ledgername, stockitem, rate, actualqty, billedqty, amount, narration))
 
     print("Writing data to CSV...")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        # updated header to include vch_type and vch_key
-        writer.writerow(['voucher_id','vch_type','vch_key','date','gl_account','amount','narration'])
-        for voucher_id, vch_type, vch_key, date, ledger, amount, narration in rows:
-            writer.writerow([voucher_id, vch_type, vch_key, date, ledger, amount, narration])
+        writer.writerow([
+            'voucher_id','vch_type','vch_key','date','vouchernumber','reference','partyname',
+            'gl_account','stockitemname','rate','actualqty','billedqty','amount','narration'
+        ])
+        for r in rows:
+            writer.writerow(r)
 
     return len(rows)
 
@@ -267,13 +279,13 @@ def main():
         
         print("=" * 60)
         print("James & James LLP")
-        print("Tally Daybook -  XML to CSV Converter")
+        print("Tally Daybook - XML to CSV Converter (with item fields + reference)")
         print("=" * 60)
         print()
         
         input_path = input("Enter the path to the XML file: ")
         input_xml_path = Path(input_path)
-        output_csv_path = input_xml_path.parent / (input_xml_path.stem + "_extracted.csv")
+        output_csv_path = input_xml_path.parent / (input_xml_path.stem + "_extracted_with_items_and_ref.csv")
         cleaned_xml_path = input_xml_path.with_name(input_xml_path.stem + "_cleaned.xml")
         WRITE_CLEANED_XML = True
 
